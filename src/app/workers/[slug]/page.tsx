@@ -1,8 +1,12 @@
 import { notFound } from "next/navigation";
+import { auth, signIn } from "@/auth";
 import { db } from "@/lib/db";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { RunForm } from "./run-form";
+import { ChatRunner } from "./chat-runner";
+import { classifyInput, classifyOutput } from "@/lib/manifest-ui";
+import { PLATFORM_MAX_FREE_RUNS } from "@/lib/manifest";
 import type { WorkerManifest } from "@/lib/manifest";
 
 export const dynamic = "force-dynamic";
@@ -11,6 +15,7 @@ export default async function WorkerDetailPage(
   props: PageProps<"/workers/[slug]">,
 ) {
   const { slug } = await props.params;
+  const session = await auth();
 
   const worker = await db.worker.findUnique({
     where: { slug },
@@ -22,6 +27,7 @@ export default async function WorkerDetailPage(
       },
       trustScores: { orderBy: { createdAt: "desc" }, take: 1 },
       reviews: { orderBy: { createdAt: "desc" }, take: 10 },
+      developer: { include: { user: true } },
     },
   });
 
@@ -30,6 +36,26 @@ export default async function WorkerDetailPage(
   const manifestRow = worker.manifests[0];
   const manifest = manifestRow?.manifest as unknown as WorkerManifest | undefined;
   const trust = worker.trustScores[0];
+  const creatorName = worker.developer.user.name ?? worker.developer.user.email;
+
+  let initialJobs: Awaited<ReturnType<typeof db.job.findMany>> = [];
+  let freeRunsUsed = 0;
+  if (session?.user?.email) {
+    const buyer = await db.user.findUnique({ where: { email: session.user.email } });
+    if (buyer) {
+      [initialJobs, freeRunsUsed] = await Promise.all([
+        db.job.findMany({
+          where: { buyerId: buyer.id, workerId: worker.id },
+          include: { escrowTransaction: { select: { id: true } } },
+          orderBy: { createdAt: "asc" },
+          take: 50,
+        }),
+        db.job.count({
+          where: { buyerId: buyer.id, workerId: worker.id, escrowTransaction: null },
+        }),
+      ]);
+    }
+  }
 
   return (
     <div className="mx-auto w-full max-w-3xl px-6 py-12">
@@ -38,9 +64,12 @@ export default async function WorkerDetailPage(
           <h1 className="text-2xl font-semibold tracking-tight">
             {worker.name}
           </h1>
-          <Badge variant="outline" className="mt-2">
-            {worker.category}
-          </Badge>
+          <div className="mt-2 flex items-center gap-2">
+            <Badge variant="outline">{worker.category}</Badge>
+            <span className="text-sm text-muted-foreground">
+              by {creatorName}
+            </span>
+          </div>
         </div>
         {trust && <Badge variant="secondary">Trust score {trust.score}</Badge>}
       </div>
@@ -68,7 +97,7 @@ export default async function WorkerDetailPage(
             <div>
               <div className="text-muted-foreground">Free trial</div>
               <div className="font-medium">
-                {manifest.trial.free_runs} runs
+                {Math.min(manifest.trial.free_runs, PLATFORM_MAX_FREE_RUNS)} runs
               </div>
             </div>
             <div>
@@ -102,10 +131,32 @@ export default async function WorkerDetailPage(
               <CardTitle className="text-base">Run this worker</CardTitle>
             </CardHeader>
             <CardContent>
-              <RunForm
-                workerSlug={worker.slug}
-                amountCents={manifest.pricing.amount_cents}
-              />
+              {session?.user ? (
+                <ChatRunner
+                  workerSlug={worker.slug}
+                  amountCents={manifest.pricing.amount_cents}
+                  freeRunsAllowed={Math.min(
+                    manifest.trial.free_runs,
+                    PLATFORM_MAX_FREE_RUNS,
+                  )}
+                  inputShape={classifyInput(manifest.input)}
+                  outputShape={classifyOutput(manifest.output)}
+                  initialJobs={JSON.parse(JSON.stringify(initialJobs))}
+                  initialFreeRunsUsed={freeRunsUsed}
+                />
+              ) : (
+                <form
+                  action={async () => {
+                    "use server";
+                    await signIn("google");
+                  }}
+                >
+                  <p className="mb-3 text-sm text-muted-foreground">
+                    Sign in to run this worker.
+                  </p>
+                  <Button type="submit">Sign in with Google</Button>
+                </form>
+              )}
             </CardContent>
           </Card>
 

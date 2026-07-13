@@ -1,7 +1,9 @@
 import Link from "next/link";
+import { UserRound, Gift } from "lucide-react";
 import { db } from "@/lib/db";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import type { WorkerManifest } from "@/lib/manifest";
 
 export const dynamic = "force-dynamic";
 
@@ -21,6 +23,7 @@ export default async function WorkersPage({
         take: 1,
       },
       trustScores: { orderBy: { createdAt: "desc" }, take: 1 },
+      developer: { include: { user: true } },
     },
     orderBy: { createdAt: "desc" },
   });
@@ -45,24 +48,63 @@ export default async function WorkersPage({
       <div className="mt-8 grid gap-4 sm:grid-cols-2">
         {workers.map((worker) => {
           const trust = worker.trustScores[0]?.score;
-          const manifest = worker.manifests[0];
+          const manifestRow = worker.manifests[0];
+          const manifest = manifestRow?.manifest as unknown as
+            | WorkerManifest
+            | undefined;
+          const creatorName =
+            worker.developer.user.name ?? worker.developer.user.email;
+
           return (
             <Link key={worker.id} href={`/workers/${worker.slug}`}>
               <Card className="h-full transition-colors hover:border-foreground/30">
                 <CardHeader>
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-start justify-between gap-2">
                     <CardTitle>{worker.name}</CardTitle>
                     {trust !== undefined && (
-                      <Badge variant="secondary">Trust {trust}</Badge>
+                      <Badge variant="secondary" className="shrink-0">
+                        Trust {trust}
+                      </Badge>
                     )}
+                  </div>
+                  <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <UserRound className="size-3.5" />
+                    {creatorName}
                   </div>
                 </CardHeader>
                 <CardContent>
-                  <Badge variant="outline">{worker.category}</Badge>
-                  {!manifest && (
-                    <p className="mt-2 text-xs text-muted-foreground">
-                      Awaiting verification
-                    </p>
+                  {manifest ? (
+                    <>
+                      <p className="line-clamp-2 text-sm text-muted-foreground">
+                        {manifest.description}
+                      </p>
+                      <div className="mt-3 flex flex-wrap items-center gap-2">
+                        <Badge variant="outline">{worker.category}</Badge>
+                        <span className="text-sm font-medium">
+                          ${(manifest.pricing.amount_cents / 100).toFixed(2)}
+                          <span className="font-normal text-muted-foreground">
+                            {" "}
+                            / {manifest.pricing.model.replace("_", " ")}
+                          </span>
+                        </span>
+                        {manifest.trial.free_runs > 0 && (
+                          <Badge
+                            variant="secondary"
+                            className="gap-1 bg-green-100 text-green-800 dark:bg-green-950 dark:text-green-300"
+                          >
+                            <Gift className="size-3" />
+                            {manifest.trial.free_runs} free
+                          </Badge>
+                        )}
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <Badge variant="outline">{worker.category}</Badge>
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        Awaiting verification
+                      </p>
+                    </>
                   )}
                 </CardContent>
               </Card>

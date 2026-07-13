@@ -1,9 +1,10 @@
 import "dotenv/config";
+import { forceIPv4Outbound } from "@/lib/network";
 import { Worker, type Job as BullJob } from "bullmq";
 import { db } from "@/lib/db";
 import { stripe } from "@/lib/stripe";
 import { centsToUsdcBaseUnits, sendUsdc } from "@/lib/crypto/server";
-import { anthropic, VERIFICATION_MODEL } from "@/lib/anthropic";
+import { llm, VERIFICATION_MODEL } from "@/lib/llm";
 import {
   QUEUE_NAMES,
   verifySecurityQueue,
@@ -15,6 +16,8 @@ import {
 import type { WorkerManifest } from "@/lib/manifest";
 import type { Prisma } from "@/generated/prisma/client";
 import type { Address } from "viem";
+
+forceIPv4Outbound();
 
 const connection = { url: process.env.REDIS_URL ?? "redis://localhost:6379" };
 
@@ -33,6 +36,22 @@ async function processWorkerExecute(bullJob: BullJob<JobExecuteData>) {
       worker: { include: { developer: true } },
     },
   });
+
+  // Retries (see defaultJobOptions in lib/queue.ts) re-run this whole
+  // function. If a previous attempt already got a real response from the
+  // developer's endpoint before failing on the DB write, re-running would
+  // call that endpoint again — a real problem for paid third-party APIs
+  // (e.g. ConvertAPI). SUCCEEDED/FAILED means a previous attempt already
+  // completed the call; skip straight to re-settling escrow instead of
+  // hitting the endpoint again.
+  if (job.status === "SUCCEEDED") {
+    await settleEscrowOnSuccess(job);
+    return;
+  }
+  if (job.status === "FAILED") {
+    await settleEscrowOnFailure(job);
+    return;
+  }
 
   const manifest = job.manifest.manifest as unknown as WorkerManifest;
   const startedAt = Date.now();
@@ -157,12 +176,15 @@ async function processVerifyDocumentation(bullJob: BullJob<VerifyManifestData>) 
     where: { id: bullJob.data.manifestId },
   });
 
-  const message = await anthropic.messages.create({
+  const completion = await llm.chat.completions.create({
     model: VERIFICATION_MODEL,
-    max_tokens: 1024,
-    system:
-      "You are the Documentation Agent for a developer marketplace. Score submitted worker documentation for quality, completeness, and honesty. Respond with ONLY JSON: {\"score\": 0-100, \"issues\": [{\"severity\": \"low\"|\"medium\"|\"high\", \"message\": string}]}.",
+    response_format: { type: "json_object" },
     messages: [
+      {
+        role: "system",
+        content:
+          "You are the Documentation Agent for a developer marketplace. Score submitted worker documentation for quality, completeness, and honesty. Respond with ONLY JSON: {\"score\": 0-100, \"issues\": [{\"severity\": \"low\"|\"medium\"|\"high\", \"message\": string}]}.",
+      },
       {
         role: "user",
         content: `Manifest:\n${JSON.stringify(manifest.manifest, null, 2)}\n\nREADME:\n${manifest.readme}`,
@@ -170,7 +192,7 @@ async function processVerifyDocumentation(bullJob: BullJob<VerifyManifestData>) 
     ],
   });
 
-  const text = message.content.find((b) => b.type === "text")?.text ?? "{}";
+  const text = completion.choices[0]?.message?.content ?? "{}";
   const { score, issues } = JSON.parse(text) as {
     score: number;
     issues: Prisma.InputJsonValue;
@@ -196,12 +218,15 @@ async function processVerifySecurity(bullJob: BullJob<VerifyManifestData>) {
     where: { id: bullJob.data.manifestId },
   });
 
-  const message = await anthropic.messages.create({
+  const completion = await llm.chat.completions.create({
     model: VERIFICATION_MODEL,
-    max_tokens: 1024,
-    system:
-      "You are the Security Agent for a developer marketplace. Review the manifest for suspicious behavior, endpoint safety, prompt-injection resistance, data-leakage risk, and credential exposure. You only flag concerns for human review — never decide bans. Respond with ONLY JSON: {\"score\": 0-100, \"issues\": [{\"severity\": \"low\"|\"medium\"|\"high\", \"message\": string}]}.",
+    response_format: { type: "json_object" },
     messages: [
+      {
+        role: "system",
+        content:
+          "You are the Security Agent for a developer marketplace. Review the manifest for suspicious behavior, endpoint safety, prompt-injection resistance, data-leakage risk, and credential exposure. You only flag concerns for human review — never decide bans. Respond with ONLY JSON: {\"score\": 0-100, \"issues\": [{\"severity\": \"low\"|\"medium\"|\"high\", \"message\": string}]}.",
+      },
       {
         role: "user",
         content: JSON.stringify(manifest.manifest, null, 2),
@@ -209,7 +234,7 @@ async function processVerifySecurity(bullJob: BullJob<VerifyManifestData>) {
     ],
   });
 
-  const text = message.content.find((b) => b.type === "text")?.text ?? "{}";
+  const text = completion.choices[0]?.message?.content ?? "{}";
   const { score, issues } = JSON.parse(text) as {
     score: number;
     issues: Prisma.InputJsonValue;

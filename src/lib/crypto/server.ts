@@ -1,4 +1,8 @@
-import "server-only";
+// No `server-only` guard here (unlike a typical Next.js server module):
+// this file is intentionally imported by both Next.js API routes AND the
+// standalone worker.ts process, which runs outside Next.js entirely and
+// would crash on the `server-only` import. Never import this from a React
+// Client Component regardless.
 import {
   createPublicClient,
   createWalletClient,

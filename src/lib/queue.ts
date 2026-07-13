@@ -5,6 +5,15 @@ const connection = {
   lazyConnect: true,
 };
 
+// Serverless Postgres (Neon) drops idle connections; the first query after
+// a quiet period can fail while it reconnects. Retrying with backoff
+// absorbs that transparently instead of permanently failing a user's job
+// over a transient DB hiccup.
+const defaultJobOptions = {
+  attempts: 3,
+  backoff: { type: "exponential" as const, delay: 2000 },
+};
+
 export const QUEUE_NAMES = {
   workerExecute: "worker.execute",
   verifyDocumentation: "verify.documentation",
@@ -23,25 +32,25 @@ export type VerifyManifestData = {
 
 export const workerExecuteQueue = new Queue<JobExecuteData>(
   QUEUE_NAMES.workerExecute,
-  { connection },
+  { connection, defaultJobOptions },
 );
 
 export const verifyDocumentationQueue = new Queue<VerifyManifestData>(
   QUEUE_NAMES.verifyDocumentation,
-  { connection },
+  { connection, defaultJobOptions },
 );
 
 export const verifySecurityQueue = new Queue<VerifyManifestData>(
   QUEUE_NAMES.verifySecurity,
-  { connection },
+  { connection, defaultJobOptions },
 );
 
 export const verifyBenchmarkQueue = new Queue<VerifyManifestData>(
   QUEUE_NAMES.verifyBenchmark,
-  { connection },
+  { connection, defaultJobOptions },
 );
 
 export const verifyJudgeQueue = new Queue<VerifyManifestData>(
   QUEUE_NAMES.verifyJudge,
-  { connection },
+  { connection, defaultJobOptions },
 );

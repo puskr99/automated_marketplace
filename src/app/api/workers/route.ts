@@ -1,23 +1,27 @@
 import { NextResponse } from "next/server";
-import { db } from "@/lib/db";
+import { auth } from "@/auth";
+import { db, findOrCreate } from "@/lib/db";
 import { validateManifest } from "@/lib/manifest";
 import { verifyDocumentationQueue } from "@/lib/queue";
 import type { Prisma } from "@/generated/prisma/client";
 
-// TODO: replace with real auth (session -> developer profile). For now the
-// caller supplies developerEmail and we upsert a User + DeveloperProfile.
 export async function POST(request: Request) {
+  const session = await auth();
+  if (!session?.user?.email) {
+    return NextResponse.json({ error: "sign in required" }, { status: 401 });
+  }
+  const developerEmail = session.user.email;
+
   const body = await request.json();
-  const { developerEmail, slug, readme, manifest: rawManifest } = body as {
-    developerEmail?: string;
+  const { slug, readme, manifest: rawManifest } = body as {
     slug?: string;
     readme?: string;
     manifest?: unknown;
   };
 
-  if (!developerEmail || !slug || !readme) {
+  if (!slug || !readme) {
     return NextResponse.json(
-      { error: "developerEmail, slug, and readme are required" },
+      { error: "slug and readme are required" },
       { status: 400 },
     );
   }
@@ -30,28 +34,28 @@ export async function POST(request: Request) {
     );
   }
 
-  const user = await db.user.upsert({
-    where: { email: developerEmail },
-    update: {},
-    create: { email: developerEmail },
-  });
+  const user = await findOrCreate(
+    () => db.user.findUnique({ where: { email: developerEmail } }),
+    () => db.user.create({ data: { email: developerEmail } }),
+  );
 
-  const developer = await db.developerProfile.upsert({
-    where: { userId: user.id },
-    update: {},
-    create: { userId: user.id },
-  });
+  const developer = await findOrCreate(
+    () => db.developerProfile.findUnique({ where: { userId: user.id } }),
+    () => db.developerProfile.create({ data: { userId: user.id } }),
+  );
 
-  const worker = await db.worker.upsert({
-    where: { slug },
-    update: {},
-    create: {
-      slug,
-      name: parsed.data.name,
-      category: parsed.data.category,
-      developerId: developer.id,
-    },
-  });
+  const worker = await findOrCreate(
+    () => db.worker.findUnique({ where: { slug } }),
+    () =>
+      db.worker.create({
+        data: {
+          slug,
+          name: parsed.data.name,
+          category: parsed.data.category,
+          developerId: developer.id,
+        },
+      }),
+  );
 
   const manifestRow = await db.workerManifest.create({
     data: {

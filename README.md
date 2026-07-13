@@ -13,13 +13,18 @@ security, benchmark, judge agents).
   `prisma.config.ts` and `src/lib/db.ts`)
 - BullMQ (Redis) for async worker execution and the verification pipeline
 - Stripe (manual capture) and USDC-on-Base (`viem`) for escrow
-- Claude (`@anthropic-ai/sdk`) for the Documentation/Security/Judge agents
+- Groq (Llama 3.3 70B, OpenAI-compatible, free tier) for the
+  Documentation/Security/Judge agents — swap the `baseURL`/model in
+  `src/lib/llm.ts` for Anthropic/OpenAI/etc. later
+- Auth.js v5 (`next-auth@beta`) with Google sign-in, JWT sessions
 
 ## Local setup
 
 1. `cp .env.example .env` and fill in `DATABASE_URL` (Neon), `REDIS_URL`
-   (Upstash), `STRIPE_SECRET_KEY`, `ANTHROPIC_API_KEY`,
-   `PLATFORM_WALLET_PRIVATE_KEY` (see Crypto payments below).
+   (Upstash), `STRIPE_SECRET_KEY`, `GROQ_API_KEY` (free, no card —
+   console.groq.com),
+   `PLATFORM_WALLET_PRIVATE_KEY` (see Crypto payments below),
+   `AUTH_GOOGLE_ID`/`AUTH_GOOGLE_SECRET` (see Auth below).
 2. `npm install`
 3. `npm run db:migrate` — creates the Postgres schema.
 4. `npm run dev` — starts the web app.
@@ -60,10 +65,21 @@ controls all escrowed funds. Fine for testnet and low-volume MVP use; before
 real volume, move to a managed custody service (Fireblocks, Coinbase Prime,
 Turnkey) so no raw private key lives in the app's environment.
 
+## Auth (Google sign-in)
+
+Google is the only provider for now. API routes derive the buyer/developer
+identity from the verified session (`auth()`), then upsert a `User` row by
+that email — no database adapter, JWT sessions only.
+
+To set up Google OAuth: create a project at console.cloud.google.com, add an
+OAuth consent screen (External, add yourself as a test user), then create an
+OAuth client ID (Web application) with authorized redirect URI
+`http://localhost:3000/api/auth/callback/google` (swap the host for your
+deployed domain in production). Put the client ID/secret in
+`AUTH_GOOGLE_ID`/`AUTH_GOOGLE_SECRET`.
+
 ## Known gaps (by design, for a first scaffold)
 
-- No auth yet — API routes take a plain email and upsert a `User`. Wire up
-  Auth.js or Clerk before this is real.
 - Benchmark Agent has no fixtures — those are category-specific (e.g.
   known-vulnerable contracts for a Solidity Auditor) and need to be curated
   per category.

@@ -15,8 +15,12 @@ const pricingSchema = z.object({
   unit: z.string().optional(), // e.g. "page", "1k_tokens" for per_unit pricing
 });
 
+// Platform-wide ceiling on free trial runs — developers can offer fewer,
+// never more, regardless of what a manifest requests.
+export const PLATFORM_MAX_FREE_RUNS = 10;
+
 const trialSchema = z.object({
-  free_runs: z.number().int().min(0).default(0),
+  free_runs: z.number().int().min(0).max(PLATFORM_MAX_FREE_RUNS).default(0),
 });
 
 const privacySchema = z.object({
