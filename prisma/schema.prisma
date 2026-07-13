@@ -1,0 +1,201 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------- Accounts ----------
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+
+  developerProfile DeveloperProfile?
+  jobs             Job[]             @relation("BuyerJobs")
+  reviews          Review[]
+
+  @@map("users")
+}
+
+model DeveloperProfile {
+  id               String   @id @default(cuid())
+  userId           String   @unique
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bio              String?
+  verified         Boolean  @default(false)
+  stripeAccountId  String? // Stripe Connect account for payouts
+  createdAt        DateTime @default(now())
+
+  workers Worker[]
+
+  @@map("developer_profiles")
+}
+
+// ---------- Workers & Manifests ----------
+
+model Worker {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  category    String
+  developerId String
+  developer   DeveloperProfile @relation(fields: [developerId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+
+  manifests     WorkerManifest[]
+  jobs          Job[]
+  reviews       Review[]
+  trustScores   TrustScoreSnapshot[]
+
+  @@index([category])
+  @@map("workers")
+}
+
+enum ManifestStatus {
+  DRAFT
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  DEPRECATED
+}
+
+// The manifest JSON itself is the source of truth for input/output schema,
+// pricing, permissions, verification, and privacy declarations (see skill.md).
+// It is stored as jsonb so field additions don't require a migration.
+model WorkerManifest {
+  id        String         @id @default(cuid())
+  workerId  String
+  worker    Worker         @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  version   String
+  manifest  Json
+  readme    String
+  status    ManifestStatus @default(DRAFT)
+  createdAt DateTime       @default(now())
+
+  verificationRuns VerificationRun[]
+  jobs             Job[]
+
+  @@unique([workerId, version])
+  @@map("worker_manifests")
+}
+
+// ---------- Verification pipeline ----------
+
+enum VerificationAgentType {
+  DOCUMENTATION
+  SECURITY
+  BENCHMARK
+  JUDGE
+}
+
+model VerificationRun {
+  id         String                @id @default(cuid())
+  manifestId String
+  manifest   WorkerManifest        @relation(fields: [manifestId], references: [id], onDelete: Cascade)
+  agentType  VerificationAgentType
+  score      Int
+  issues     Json // array of { severity, message }
+  createdAt  DateTime              @default(now())
+
+  @@index([manifestId, agentType])
+  @@map("verification_runs")
+}
+
+model TrustScoreSnapshot {
+  id        String   @id @default(cuid())
+  workerId  String
+  worker    Worker   @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  score     Int
+  breakdown Json // { benchmark, ratings, completionRate, refundRate, reliability, verification }
+  createdAt DateTime @default(now())
+
+  @@index([workerId])
+  @@map("trust_score_snapshots")
+}
+
+// ---------- Jobs, escrow, reviews ----------
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+enum OutcomePolicy {
+  FRIENDLY
+  STANDARD
+  STRICT
+}
+
+model Job {
+  id         String        @id @default(cuid())
+  workerId   String
+  worker     Worker        @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  manifestId String
+  manifest   WorkerManifest @relation(fields: [manifestId], references: [id], onDelete: Restrict)
+  buyerId    String
+  buyer      User          @relation("BuyerJobs", fields: [buyerId], references: [id], onDelete: Cascade)
+
+  input  Json
+  output Json?
+
+  status        JobStatus     @default(PENDING)
+  outcomePolicy OutcomePolicy @default(STANDARD)
+  latencyMs     Int?
+  costCents     Int
+  errorMessage  String?
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  escrowTransaction EscrowTransaction?
+  review            Review?
+
+  @@index([workerId, status])
+  @@index([buyerId])
+  @@map("jobs")
+}
+
+enum EscrowStatus {
+  AUTHORIZED
+  CAPTURED
+  VOIDED
+  REFUNDED
+}
+
+model EscrowTransaction {
+  id                    String       @id @default(cuid())
+  jobId                 String       @unique
+  job                   Job          @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  stripePaymentIntentId String?      @unique
+  amountCents           Int
+  currency              String       @default("usd")
+  status                EscrowStatus @default(AUTHORIZED)
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
+
+  @@map("escrow_transactions")
+}
+
+model Review {
+  id        String   @id @default(cuid())
+  jobId     String   @unique
+  job       Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  workerId  String
+  worker    Worker   @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  buyerId   String
+  buyer     User     @relation(fields: [buyerId], references: [id], onDelete: Cascade)
+  rating    Int // 1-5
+  comment   String?
+  createdAt DateTime @default(now())
+
+  @@index([workerId])
+  @@map("reviews")
+}
