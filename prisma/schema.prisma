@@ -29,6 +29,7 @@ model DeveloperProfile {
   bio              String?
   verified         Boolean  @default(false)
   stripeAccountId  String? // Stripe Connect account for payouts
+  payoutWalletAddress String? // EVM address for USDC payouts
   createdAt        DateTime @default(now())
 
   workers Worker[]
@@ -170,16 +171,28 @@ enum EscrowStatus {
   REFUNDED
 }
 
+enum EscrowProvider {
+  STRIPE
+  CRYPTO_USDC
+}
+
 model EscrowTransaction {
-  id                    String       @id @default(cuid())
-  jobId                 String       @unique
-  job                   Job          @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  stripePaymentIntentId String?      @unique
+  id                    String         @id @default(cuid())
+  jobId                 String         @unique
+  job                   Job            @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  provider              EscrowProvider @default(STRIPE)
+  stripePaymentIntentId String?        @unique
+  // crypto (USDC on Base): the buyer's wallet and the on-chain deposit tx,
+  // verified before the job is queued. payoutTxHash is set once funds are
+  // released to the developer (success) or refunded to the buyer (failure).
+  payerAddress          String?
+  depositTxHash         String?        @unique
+  payoutTxHash          String?
   amountCents           Int
-  currency              String       @default("usd")
-  status                EscrowStatus @default(AUTHORIZED)
-  createdAt             DateTime     @default(now())
-  updatedAt             DateTime     @updatedAt
+  currency              String         @default("usd")
+  status                EscrowStatus   @default(AUTHORIZED)
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
 
   @@map("escrow_transactions")
 }

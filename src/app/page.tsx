@@ -13,10 +13,15 @@ export default function Home() {
         benchmarks, reputation, and verification.
       </p>
       <div className="mt-10 flex gap-4">
-        <Button size="lg" render={<Link href="/workers">Browse workers</Link>} />
+        <Button
+          size="lg"
+          nativeButton={false}
+          render={<Link href="/workers">Browse workers</Link>}
+        />
         <Button
           size="lg"
           variant="outline"
+          nativeButton={false}
           render={<Link href="/developer/workers/new">Publish a worker</Link>}
         />
       </div>

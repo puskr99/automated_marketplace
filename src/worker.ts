@@ -2,6 +2,7 @@ import "dotenv/config";
 import { Worker, type Job as BullJob } from "bullmq";
 import { db } from "@/lib/db";
 import { stripe } from "@/lib/stripe";
+import { centsToUsdcBaseUnits, sendUsdc } from "@/lib/crypto/server";
 import { anthropic, VERIFICATION_MODEL } from "@/lib/anthropic";
 import {
   QUEUE_NAMES,
@@ -13,6 +14,7 @@ import {
 } from "@/lib/queue";
 import type { WorkerManifest } from "@/lib/manifest";
 import type { Prisma } from "@/generated/prisma/client";
+import type { Address } from "viem";
 
 const connection = { url: process.env.REDIS_URL ?? "redis://localhost:6379" };
 
@@ -25,7 +27,11 @@ const connection = { url: process.env.REDIS_URL ?? "redis://localhost:6379" };
 async function processWorkerExecute(bullJob: BullJob<JobExecuteData>) {
   const job = await db.job.findUniqueOrThrow({
     where: { id: bullJob.data.jobId },
-    include: { manifest: true, escrowTransaction: true },
+    include: {
+      manifest: true,
+      escrowTransaction: true,
+      worker: { include: { developer: true } },
+    },
   });
 
   const manifest = job.manifest.manifest as unknown as WorkerManifest;
@@ -60,15 +66,7 @@ async function processWorkerExecute(bullJob: BullJob<JobExecuteData>) {
       data: { status: "SUCCEEDED", output, latencyMs, completedAt: new Date() },
     });
 
-    if (job.escrowTransaction?.stripePaymentIntentId) {
-      await stripe.paymentIntents.capture(
-        job.escrowTransaction.stripePaymentIntentId,
-      );
-      await db.escrowTransaction.update({
-        where: { jobId: job.id },
-        data: { status: "CAPTURED" },
-      });
-    }
+    await settleEscrowOnSuccess(job);
   } catch (err) {
     const latencyMs = Date.now() - startedAt;
     const message = err instanceof Error ? err.message : "unknown error";
@@ -84,15 +82,71 @@ async function processWorkerExecute(bullJob: BullJob<JobExecuteData>) {
     });
 
     // Automatic refund: unavailable / timeout / invalid response / server failure.
-    if (job.escrowTransaction?.stripePaymentIntentId) {
-      await stripe.paymentIntents.cancel(
-        job.escrowTransaction.stripePaymentIntentId,
-      );
-      await db.escrowTransaction.update({
-        where: { jobId: job.id },
-        data: { status: "VOIDED" },
-      });
+    await settleEscrowOnFailure(job);
+  }
+}
+
+type JobWithEscrowAndDeveloper = Prisma.JobGetPayload<{
+  include: {
+    manifest: true;
+    escrowTransaction: true;
+    worker: { include: { developer: true } };
+  };
+}>;
+
+async function settleEscrowOnSuccess(job: JobWithEscrowAndDeveloper) {
+  const escrow = job.escrowTransaction;
+  if (!escrow) return;
+
+  if (escrow.provider === "STRIPE" && escrow.stripePaymentIntentId) {
+    await stripe.paymentIntents.capture(escrow.stripePaymentIntentId);
+    await db.escrowTransaction.update({
+      where: { jobId: job.id },
+      data: { status: "CAPTURED" },
+    });
+    return;
+  }
+
+  if (escrow.provider === "CRYPTO_USDC") {
+    const payoutAddress = job.worker.developer.payoutWalletAddress;
+    if (!payoutAddress) {
+      // No payout wallet on file — leave AUTHORIZED for manual settlement
+      // rather than silently stranding the funds or guessing an address.
+      return;
     }
+    const txHash = await sendUsdc(
+      payoutAddress as Address,
+      centsToUsdcBaseUnits(escrow.amountCents),
+    );
+    await db.escrowTransaction.update({
+      where: { jobId: job.id },
+      data: { status: "CAPTURED", payoutTxHash: txHash },
+    });
+  }
+}
+
+async function settleEscrowOnFailure(job: JobWithEscrowAndDeveloper) {
+  const escrow = job.escrowTransaction;
+  if (!escrow) return;
+
+  if (escrow.provider === "STRIPE" && escrow.stripePaymentIntentId) {
+    await stripe.paymentIntents.cancel(escrow.stripePaymentIntentId);
+    await db.escrowTransaction.update({
+      where: { jobId: job.id },
+      data: { status: "VOIDED" },
+    });
+    return;
+  }
+
+  if (escrow.provider === "CRYPTO_USDC" && escrow.payerAddress) {
+    const txHash = await sendUsdc(
+      escrow.payerAddress as Address,
+      centsToUsdcBaseUnits(escrow.amountCents),
+    );
+    await db.escrowTransaction.update({
+      where: { jobId: job.id },
+      data: { status: "REFUNDED", payoutTxHash: txHash },
+    });
   }
 }
 
@@ -254,26 +308,35 @@ async function processVerifyJudge(bullJob: BullJob<VerifyManifestData>) {
   });
 }
 
-new Worker<JobExecuteData>(QUEUE_NAMES.workerExecute, processWorkerExecute, {
-  connection,
-});
-new Worker<VerifyManifestData>(
-  QUEUE_NAMES.verifyDocumentation,
-  processVerifyDocumentation,
-  { connection },
-);
-new Worker<VerifyManifestData>(
-  QUEUE_NAMES.verifySecurity,
-  processVerifySecurity,
-  { connection },
-);
-new Worker<VerifyManifestData>(
-  QUEUE_NAMES.verifyBenchmark,
-  processVerifyBenchmark,
-  { connection },
-);
-new Worker<VerifyManifestData>(QUEUE_NAMES.verifyJudge, processVerifyJudge, {
-  connection,
-});
+const workers = [
+  new Worker<JobExecuteData>(QUEUE_NAMES.workerExecute, processWorkerExecute, {
+    connection,
+  }),
+  new Worker<VerifyManifestData>(
+    QUEUE_NAMES.verifyDocumentation,
+    processVerifyDocumentation,
+    { connection },
+  ),
+  new Worker<VerifyManifestData>(
+    QUEUE_NAMES.verifySecurity,
+    processVerifySecurity,
+    { connection },
+  ),
+  new Worker<VerifyManifestData>(
+    QUEUE_NAMES.verifyBenchmark,
+    processVerifyBenchmark,
+    { connection },
+  ),
+  new Worker<VerifyManifestData>(QUEUE_NAMES.verifyJudge, processVerifyJudge, {
+    connection,
+  }),
+];
+
+for (const w of workers) {
+  w.on("completed", (job) => console.log(`[${w.name}] completed ${job.id}`));
+  w.on("failed", (job, err) =>
+    console.error(`[${w.name}] failed ${job?.id}: ${err.message}`),
+  );
+}
 
 console.log("worker process started, listening on all queues");

@@ -102,7 +102,10 @@ export default async function WorkerDetailPage(
               <CardTitle className="text-base">Run this worker</CardTitle>
             </CardHeader>
             <CardContent>
-              <RunForm workerSlug={worker.slug} />
+              <RunForm
+                workerSlug={worker.slug}
+                amountCents={manifest.pricing.amount_cents}
+              />
             </CardContent>
           </Card>
 
