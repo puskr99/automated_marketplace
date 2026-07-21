@@ -4,8 +4,10 @@ import { db } from "@/lib/db";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { MarginAds } from "@/components/margin-ads";
 import { ChatRunner } from "./chat-runner";
 import { classifyInput, classifyOutput } from "@/lib/manifest-ui";
+import { formatSc } from "@/lib/currency";
 import { PLATFORM_MAX_FREE_RUNS } from "@/lib/manifest";
 import type { WorkerManifest } from "@/lib/manifest";
 
@@ -51,7 +53,7 @@ export default async function WorkerDetailPage(
           take: 50,
         }),
         db.job.count({
-          where: { buyerId: buyer.id, workerId: worker.id, escrowTransaction: null },
+          where: { buyerId: buyer.id, workerId: worker.id, isFreeTrial: true },
         }),
       ]);
     }
@@ -59,6 +61,7 @@ export default async function WorkerDetailPage(
 
   return (
     <div className="mx-auto w-full max-w-3xl px-6 py-12">
+      <MarginAds contentWidthPx={768} />
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">
@@ -89,8 +92,7 @@ export default async function WorkerDetailPage(
             <div>
               <div className="text-muted-foreground">Price</div>
               <div className="font-medium">
-                ${(manifest.pricing.amount_cents / 100).toFixed(2)}{" "}
-                {manifest.pricing.currency.toUpperCase()} /{" "}
+                {formatSc(manifest.pricing.amount_cents)} /{" "}
                 {manifest.pricing.model.replace("_", " ")}
               </div>
             </div>

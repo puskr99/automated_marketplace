@@ -18,6 +18,7 @@ model User {
   developerProfile DeveloperProfile?
   jobs             Job[]             @relation("BuyerJobs")
   reviews          Review[]
+  creditAccount    CreditAccount?
 
   @@map("users")
 }
@@ -31,6 +32,7 @@ model DeveloperProfile {
   stripeAccountId  String? // Stripe Connect account for payouts
   payoutWalletAddress String? // EVM address for USDC payouts
   createdAt        DateTime @default(now())
+  termsAcceptedAt  DateTime? // set once they accept the developer terms/privacy gate; re-shown until then
 
   workers Worker[]
 
@@ -153,11 +155,20 @@ model Job {
   costCents     Int
   errorMessage  String?
 
+  // Explicit instead of inferred from `escrowTransaction == null` — that
+  // inference broke once credit-funded jobs also stopped creating an escrow
+  // row. bonusCentsSpent is the split of costCents paid from the buyer's
+  // non-withdrawable bonus balance (the rest came from withdrawable); a
+  // refund on failure repays each bucket it came from.
+  isFreeTrial     Boolean @default(false)
+  bonusCentsSpent Int     @default(0)
+
   createdAt   DateTime  @default(now())
   completedAt DateTime?
 
-  escrowTransaction EscrowTransaction?
-  review            Review?
+  escrowTransaction  EscrowTransaction?
+  creditTransactions CreditTransaction[]
+  review             Review?
 
   @@index([workerId, status])
   @@index([buyerId])
@@ -195,6 +206,68 @@ model EscrowTransaction {
   updatedAt             DateTime       @updatedAt
 
   @@map("escrow_transactions")
+}
+
+// ---------- Credits ----------
+// Platform-internal currency: deposit real money (Stripe/USDC) once, then
+// spend it on worker runs without a per-call payment transaction. Two
+// balances per account, kept deliberately separate:
+//   - withdrawableCents: backed 1:1 by real deposits (or job earnings for
+//     developers). Redeemable back to real money.
+//   - bonusCents: earned by watching ads. Spendable on worker runs only —
+//     never withdrawable — so ad-watching can never be turned into a cash
+//     payout (the fraud path a shared balance would open up).
+// Balance mutations go through lib/credits.ts, which uses single guarded
+// UPDATE statements rather than multi-statement transactions (the Neon HTTP
+// adapter doesn't support the latter — see lib/db.ts).
+
+model CreditAccount {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  withdrawableCents Int      @default(0)
+  bonusCents        Int      @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  transactions CreditTransaction[]
+
+  @@map("credit_accounts")
+}
+
+enum CreditBalance {
+  WITHDRAWABLE
+  BONUS
+}
+
+enum CreditTransactionType {
+  DEPOSIT // real money -> withdrawable
+  WITHDRAWAL // withdrawable -> real money payout
+  AD_REWARD // watched an ad -> bonus
+  JOB_SPEND // buyer paying for a run (debit)
+  JOB_EARNING // developer paid for a completed run (always withdrawable)
+  JOB_REFUND // failed run refunded back to the buyer
+}
+
+// One row per balance mutation — the audit trail `CreditAccount`'s running
+// totals are checked against. `reference` is a namespaced idempotency key
+// (e.g. "deposit:<txHash>", "stripe_checkout:<sessionId>", "payout:<txHash>",
+// "ad:<watchId>") so retries (webhooks, crypto confirmations) can't double-credit.
+model CreditTransaction {
+  id          String                @id @default(cuid())
+  accountId   String
+  account     CreditAccount         @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  type        CreditTransactionType
+  balance     CreditBalance
+  amountCents Int // positive = credited, negative = debited
+  jobId       String?
+  job         Job?                  @relation(fields: [jobId], references: [id], onDelete: SetNull)
+  reference   String?               @unique
+  metadata    Json?
+  createdAt   DateTime              @default(now())
+
+  @@index([accountId])
+  @@map("credit_transactions")
 }
 
 model Review {

@@ -2,8 +2,7 @@ import "dotenv/config";
 import { forceIPv4Outbound } from "@/lib/network";
 import { Worker, type Job as BullJob } from "bullmq";
 import { db } from "@/lib/db";
-import { stripe } from "@/lib/stripe";
-import { centsToUsdcBaseUnits, sendUsdc } from "@/lib/crypto/server";
+import { earnForJob, refundJob } from "@/lib/credits";
 import { llm, VERIFICATION_MODEL } from "@/lib/llm";
 import {
   QUEUE_NAMES,
@@ -15,14 +14,13 @@ import {
 } from "@/lib/queue";
 import type { WorkerManifest } from "@/lib/manifest";
 import type { Prisma } from "@/generated/prisma/client";
-import type { Address } from "viem";
 
 forceIPv4Outbound();
 
 const connection = { url: process.env.REDIS_URL ?? "redis://localhost:6379" };
 
 // ---------- Worker execution ----------
-// Calls the developer's endpoint, records the result, and settles escrow.
+// Calls the developer's endpoint, records the result, and settles credits.
 // Automatic refund cases per skill.md: API unavailable, timeout, invalid
 // response, server failure. Anything beyond that follows the worker's
 // declared outcome_policy (not yet implemented — flagged below).
@@ -32,8 +30,7 @@ async function processWorkerExecute(bullJob: BullJob<JobExecuteData>) {
     where: { id: bullJob.data.jobId },
     include: {
       manifest: true,
-      escrowTransaction: true,
-      worker: { include: { developer: true } },
+      worker: { include: { developer: { include: { user: true } } } },
     },
   });
 
@@ -42,14 +39,15 @@ async function processWorkerExecute(bullJob: BullJob<JobExecuteData>) {
   // developer's endpoint before failing on the DB write, re-running would
   // call that endpoint again — a real problem for paid third-party APIs
   // (e.g. ConvertAPI). SUCCEEDED/FAILED means a previous attempt already
-  // completed the call; skip straight to re-settling escrow instead of
-  // hitting the endpoint again.
+  // completed the call; skip straight to re-settling credits instead of
+  // hitting the endpoint again. (earnForJob/refundJob no-op if already
+  // settled, so this is also safe if a previous attempt got that far too.)
   if (job.status === "SUCCEEDED") {
-    await settleEscrowOnSuccess(job);
+    await settleCreditsOnSuccess(job);
     return;
   }
   if (job.status === "FAILED") {
-    await settleEscrowOnFailure(job);
+    await settleCreditsOnFailure(job);
     return;
   }
 
@@ -85,7 +83,7 @@ async function processWorkerExecute(bullJob: BullJob<JobExecuteData>) {
       data: { status: "SUCCEEDED", output, latencyMs, completedAt: new Date() },
     });
 
-    await settleEscrowOnSuccess(job);
+    await settleCreditsOnSuccess(job);
   } catch (err) {
     const latencyMs = Date.now() - startedAt;
     const message = err instanceof Error ? err.message : "unknown error";
@@ -101,72 +99,43 @@ async function processWorkerExecute(bullJob: BullJob<JobExecuteData>) {
     });
 
     // Automatic refund: unavailable / timeout / invalid response / server failure.
-    await settleEscrowOnFailure(job);
+    await settleCreditsOnFailure(job);
   }
 }
 
-type JobWithEscrowAndDeveloper = Prisma.JobGetPayload<{
+type JobWithDeveloper = Prisma.JobGetPayload<{
   include: {
     manifest: true;
-    escrowTransaction: true;
-    worker: { include: { developer: true } };
+    worker: { include: { developer: { include: { user: true } } } };
   };
 }>;
 
-async function settleEscrowOnSuccess(job: JobWithEscrowAndDeveloper) {
-  const escrow = job.escrowTransaction;
-  if (!escrow) return;
+async function settleCreditsOnSuccess(job: JobWithDeveloper) {
+  if (job.isFreeTrial) return; // no money moved for free trials
 
-  if (escrow.provider === "STRIPE" && escrow.stripePaymentIntentId) {
-    await stripe.paymentIntents.capture(escrow.stripePaymentIntentId);
-    await db.escrowTransaction.update({
-      where: { jobId: job.id },
-      data: { status: "CAPTURED" },
-    });
-    return;
-  }
+  // Self-dealing guard: a developer running their own worker as the buyer
+  // must not be able to launder bonus (ad-earned, never-withdrawable)
+  // credits into real withdrawable earnings by paying themselves out of
+  // their own bonus balance. Any real-money portion they spent is still a
+  // wash either way (they paid it, they get it back), so only the
+  // bonus-funded slice is withheld — this doesn't block developers from
+  // testing their own worker, it just makes doing so with bonus credits
+  // non-profitable.
+  const isSelfDealing = job.buyerId === job.worker.developer.userId;
+  const amountCents = isSelfDealing
+    ? job.costCents - job.bonusCentsSpent
+    : job.costCents;
 
-  if (escrow.provider === "CRYPTO_USDC") {
-    const payoutAddress = job.worker.developer.payoutWalletAddress;
-    if (!payoutAddress) {
-      // No payout wallet on file — leave AUTHORIZED for manual settlement
-      // rather than silently stranding the funds or guessing an address.
-      return;
-    }
-    const txHash = await sendUsdc(
-      payoutAddress as Address,
-      centsToUsdcBaseUnits(escrow.amountCents),
-    );
-    await db.escrowTransaction.update({
-      where: { jobId: job.id },
-      data: { status: "CAPTURED", payoutTxHash: txHash },
-    });
-  }
+  await earnForJob({
+    developerUserId: job.worker.developer.userId,
+    jobId: job.id,
+    amountCents,
+  });
 }
 
-async function settleEscrowOnFailure(job: JobWithEscrowAndDeveloper) {
-  const escrow = job.escrowTransaction;
-  if (!escrow) return;
-
-  if (escrow.provider === "STRIPE" && escrow.stripePaymentIntentId) {
-    await stripe.paymentIntents.cancel(escrow.stripePaymentIntentId);
-    await db.escrowTransaction.update({
-      where: { jobId: job.id },
-      data: { status: "VOIDED" },
-    });
-    return;
-  }
-
-  if (escrow.provider === "CRYPTO_USDC" && escrow.payerAddress) {
-    const txHash = await sendUsdc(
-      escrow.payerAddress as Address,
-      centsToUsdcBaseUnits(escrow.amountCents),
-    );
-    await db.escrowTransaction.update({
-      where: { jobId: job.id },
-      data: { status: "REFUNDED", payoutTxHash: txHash },
-    });
-  }
+async function settleCreditsOnFailure(job: JobWithDeveloper) {
+  if (job.isFreeTrial) return;
+  await refundJob(job);
 }
 
 // ---------- Verification: Documentation Agent ----------

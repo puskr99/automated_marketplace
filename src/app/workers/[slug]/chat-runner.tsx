@@ -1,9 +1,11 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
-import { Send, Paperclip, Download, Loader2, Gift, Wallet } from "lucide-react";
+import { Send, Paperclip, Download, Loader2, Gift, Coins } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { formatSc } from "@/lib/currency";
 import type { InputShape, OutputShape } from "@/lib/manifest-ui";
 
 type JobDTO = {
@@ -174,6 +176,7 @@ export function ChatRunner({
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [insufficientCredits, setInsufficientCredits] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const freeRunsRemaining = Math.max(0, freeRunsAllowed - freeRunsUsed);
@@ -206,29 +209,19 @@ export function ChatRunner({
 
     try {
       const input = buildInput();
-      const body: Record<string, unknown> = { workerSlug, input };
-
-      if (!isFreeTrial) {
-        const { centsToUsdcBaseUnits, sendUsdcFromInjectedWallet } = await import(
-          "@/lib/crypto/client"
-        );
-        const configRes = await fetch("/api/crypto/config");
-        const config = await configRes.json();
-        if (!configRes.ok) throw new Error(config.error ?? "payment unavailable");
-        body.paymentMethod = "crypto_usdc";
-        body.depositTxHash = await sendUsdcFromInjectedWallet(
-          config.depositAddress,
-          centsToUsdcBaseUnits(amountCents),
-        );
-      }
 
       const res = await fetch("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ workerSlug, input }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "request failed");
+      if (!res.ok) {
+        if (res.status === 402 && data.insufficientCredits) {
+          setInsufficientCredits(true);
+        }
+        throw new Error(data.error ?? "request failed");
+      }
 
       const optimisticJob: JobDTO = {
         id: data.jobId,
@@ -237,11 +230,12 @@ export function ChatRunner({
         status: "PENDING",
         errorMessage: null,
         createdAt: new Date().toISOString(),
-        escrowTransaction: isFreeTrial ? null : { id: "pending" },
+        escrowTransaction: isFreeTrial ? null : { id: "credits" },
       };
       setJobs((prev) => [...prev, optimisticJob]);
       if (isFreeTrial) setFreeRunsUsed((n) => n + 1);
       setValue("");
+      setInsufficientCredits(false);
 
       await pollJob(data.jobId);
     } catch (err) {
@@ -315,12 +309,25 @@ export function ChatRunner({
             </span>
           ) : (
             <span className="flex items-center gap-1">
-              <Wallet className="size-3.5" />
-              Free trial used — ${(amountCents / 100).toFixed(2)} in USDC per run
+              <Coins className="size-3.5" />
+              Free trial used — {formatSc(amountCents)} per run
             </span>
           )}
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <p className="text-sm text-destructive">
+            {error}
+            {insufficientCredits && (
+              <>
+                {" "}
+                <Link href="/credits" className="underline">
+                  Top up credits
+                </Link>
+                .
+              </>
+            )}
+          </p>
+        )}
       </form>
     </div>
   );

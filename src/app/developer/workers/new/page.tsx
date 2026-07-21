@@ -1,9 +1,20 @@
 import { auth, signIn } from "@/auth";
 import { Button } from "@/components/ui/button";
+import { db } from "@/lib/db";
 import { NewWorkerForm } from "./new-worker-form";
+import { DeveloperTermsGate } from "./developer-terms-gate";
+import { acceptDeveloperTerms } from "./terms-actions";
 
 export default async function NewWorkerPage() {
   const session = await auth();
+
+  const developerProfile = session?.user?.email
+    ? await db.developerProfile.findFirst({
+        where: { user: { email: session.user.email } },
+        select: { termsAcceptedAt: true },
+      })
+    : null;
+  const termsAccepted = developerProfile?.termsAcceptedAt != null;
 
   return (
     <div className="mx-auto w-full max-w-2xl px-6 py-12">
@@ -16,8 +27,10 @@ export default async function NewWorkerPage() {
         approved.
       </p>
 
-      {session?.user ? (
+      {session?.user && termsAccepted ? (
         <NewWorkerForm />
+      ) : session?.user ? (
+        <DeveloperTermsGate onAccept={acceptDeveloperTerms} />
       ) : (
         <form
           action={async () => {

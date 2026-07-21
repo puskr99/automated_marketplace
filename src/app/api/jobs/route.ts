@@ -1,35 +1,36 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { db, findOrCreate } from "@/lib/db";
-import { stripe } from "@/lib/stripe";
 import { workerExecuteQueue } from "@/lib/queue";
-import { centsToUsdcBaseUnits, verifyUsdcDeposit } from "@/lib/crypto/server";
+import { spendForJob, refundJob, InsufficientCreditsError } from "@/lib/credits";
 import { PLATFORM_MAX_FREE_RUNS } from "@/lib/manifest";
 import type { WorkerManifest } from "@/lib/manifest";
-import type { Hash } from "viem";
 
-// A job with no escrow row is how a free-trial run is represented — see
-// the free-trial branch below. Counting those per (buyer, worker) is how
-// remaining trial runs are computed, both here and on GET.
 async function countFreeRunsUsed(buyerId: string, workerId: string) {
   return db.job.count({
-    where: { buyerId, workerId, escrowTransaction: null },
+    where: { buyerId, workerId, isFreeTrial: true },
   });
 }
 
-// If enqueueing fails after the job row exists (e.g. a Redis blip), a
-// free-trial job would otherwise sit orphaned in PENDING forever and
-// silently burn one of the buyer's limited free runs for nothing. Delete
-// it instead so the run isn't wasted and the caller gets a clean error to
-// retry. (Paid jobs don't get this cleanup — same failure there would mean
-// money already collected with no job to run; rare enough, and out of
-// scope here, to just surface the error rather than attempt an inline
-// refund outside the normal settlement path in worker.ts.)
-async function enqueueOrDelete(jobId: string) {
+// If enqueueing fails after the job row exists (e.g. a Redis blip), it would
+// otherwise sit orphaned in PENDING forever. For a free-trial job that just
+// wastes one of the buyer's limited free runs for nothing, so delete it. For
+// a credit-funded job, credits were already spent — refund them first so the
+// buyer isn't out money for a run that never happened, then delete.
+async function enqueueOrRefundAndDelete(job: {
+  id: string;
+  buyerId: string;
+  costCents: number;
+  bonusCentsSpent: number;
+  isFreeTrial: boolean;
+}) {
   try {
-    await workerExecuteQueue.add("execute", { jobId });
+    await workerExecuteQueue.add("execute", { jobId: job.id });
   } catch (err) {
-    await db.job.delete({ where: { id: jobId } });
+    if (!job.isFreeTrial) {
+      await refundJob(job);
+    }
+    await db.job.delete({ where: { id: job.id } });
     throw err;
   }
 }
@@ -73,11 +74,9 @@ export async function POST(request: Request) {
   const buyerEmail = session.user.email;
 
   const body = await request.json();
-  const { workerSlug, input, paymentMethod, depositTxHash } = body as {
+  const { workerSlug, input } = body as {
     workerSlug?: string;
     input?: unknown;
-    paymentMethod?: "stripe" | "crypto_usdc";
-    depositTxHash?: string;
   };
 
   if (!workerSlug || input === undefined) {
@@ -129,10 +128,11 @@ export async function POST(request: Request) {
         input: input as object,
         costCents: manifest.pricing.amount_cents,
         outcomePolicy: manifest.outcome_policy,
+        isFreeTrial: true,
       },
     });
     try {
-      await enqueueOrDelete(job.id);
+      await enqueueOrRefundAndDelete(job);
     } catch {
       return NextResponse.json(
         { error: "failed to queue job — please try again" },
@@ -149,37 +149,10 @@ export async function POST(request: Request) {
     );
   }
 
-  // Trial exhausted (or none offered) — payment is required from here on.
-  if (paymentMethod === "crypto_usdc" && !depositTxHash) {
-    return NextResponse.json(
-      { error: "depositTxHash is required for crypto_usdc payments" },
-      { status: 400 },
-    );
-  }
-  if (!paymentMethod) {
-    return NextResponse.json(
-      { error: "free trial exhausted — paymentMethod is required", freeTrialExhausted: true },
-      { status: 402 },
-    );
-  }
-
-  // Crypto payment already happened client-side (buyer sent USDC from their
-  // wallet before calling this endpoint) — verify it on-chain before we
-  // trust anything the client reported.
-  let verifiedPayerAddress: string | undefined;
-  if (paymentMethod === "crypto_usdc") {
-    try {
-      const deposit = await verifyUsdcDeposit(
-        depositTxHash as Hash,
-        centsToUsdcBaseUnits(manifest.pricing.amount_cents),
-      );
-      verifiedPayerAddress = deposit.fromAddress;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "invalid deposit";
-      return NextResponse.json({ error: message }, { status: 400 });
-    }
-  }
-
+  // Trial exhausted (or none offered) — spend from the buyer's credit
+  // balance (bonus first, then withdrawable). No per-job Stripe/crypto call:
+  // that already happened, once, when the buyer deposited into their credit
+  // balance (see /api/credits/deposit/*).
   const job = await db.job.create({
     data: {
       workerId: worker.id,
@@ -191,56 +164,33 @@ export async function POST(request: Request) {
     },
   });
 
-  if (paymentMethod === "crypto_usdc") {
-    try {
-      await db.escrowTransaction.create({
-        data: {
-          jobId: job.id,
-          provider: "CRYPTO_USDC",
-          payerAddress: verifiedPayerAddress,
-          depositTxHash: depositTxHash,
-          amountCents: manifest.pricing.amount_cents,
-          currency: "usdc",
-          status: "AUTHORIZED",
-        },
-      });
-    } catch {
-      // Unique constraint on depositTxHash — this tx was already used to
-      // fund a different job (replay attempt).
-      await db.job.delete({ where: { id: job.id } });
+  let spend: { bonusCentsSpent: number; withdrawableCentsSpent: number };
+  try {
+    spend = await spendForJob(buyer.id, job.id, manifest.pricing.amount_cents);
+  } catch (err) {
+    await db.job.delete({ where: { id: job.id } });
+    if (err instanceof InsufficientCreditsError) {
       return NextResponse.json(
-        { error: "this deposit transaction has already been used" },
-        { status: 409 },
+        { error: "insufficient credits — top up in Credits", insufficientCredits: true },
+        { status: 402 },
       );
     }
-
-    await workerExecuteQueue.add("execute", { jobId: job.id });
-    return NextResponse.json({ jobId: job.id }, { status: 201 });
+    throw err;
   }
 
-  // Stripe: authorize now, capture on success, void/refund on failure.
-  const paymentIntent = await stripe.paymentIntents.create({
-    amount: manifest.pricing.amount_cents,
-    currency: manifest.pricing.currency,
-    capture_method: "manual",
-    metadata: { jobId: job.id },
+  await db.job.update({
+    where: { id: job.id },
+    data: { bonusCentsSpent: spend.bonusCentsSpent },
   });
 
-  await db.escrowTransaction.create({
-    data: {
-      jobId: job.id,
-      provider: "STRIPE",
-      stripePaymentIntentId: paymentIntent.id,
-      amountCents: manifest.pricing.amount_cents,
-      currency: manifest.pricing.currency,
-      status: "AUTHORIZED",
-    },
-  });
+  try {
+    await enqueueOrRefundAndDelete({ ...job, bonusCentsSpent: spend.bonusCentsSpent });
+  } catch {
+    return NextResponse.json(
+      { error: "failed to queue job — please try again" },
+      { status: 503 },
+    );
+  }
 
-  await workerExecuteQueue.add("execute", { jobId: job.id });
-
-  return NextResponse.json(
-    { jobId: job.id, clientSecret: paymentIntent.client_secret },
-    { status: 201 },
-  );
+  return NextResponse.json({ jobId: job.id }, { status: 201 });
 }

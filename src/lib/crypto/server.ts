@@ -15,7 +15,13 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { chain, USDC_ADDRESS, erc20Abi } from "./constants";
 
-export { chain, USDC_ADDRESS, USDC_DECIMALS, centsToUsdcBaseUnits } from "./constants";
+export {
+  chain,
+  USDC_ADDRESS,
+  USDC_DECIMALS,
+  centsToUsdcBaseUnits,
+  usdcBaseUnitsToCents,
+} from "./constants";
 
 export const publicClient = createPublicClient({ chain, transport: http() });
 

@@ -25,3 +25,10 @@ export const erc20Abi = parseAbi([
 export function centsToUsdcBaseUnits(cents: number): bigint {
   return BigInt(cents) * BigInt(10_000); // 1 cent = 0.01 USDC = 10,000 base units (6 decimals)
 }
+
+// Truncates towards zero — a deposit isn't a whole number of cents in USDC
+// base units, the dust is simply not credited (never rounds in the depositor's
+// favor).
+export function usdcBaseUnitsToCents(baseUnits: bigint): number {
+  return Number(baseUnits / BigInt(10_000));
+}

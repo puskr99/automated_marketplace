@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { stripe } from "@/lib/stripe";
 import { db } from "@/lib/db";
+import { depositCredits } from "@/lib/credits";
 
 // Handles Stripe events that happen outside our own capture/cancel calls
 // (e.g. disputes, async payment failures). Register this route's URL in the
@@ -35,6 +36,27 @@ export async function POST(request: Request) {
     }
     case "charge.dispute.created": {
       // TODO: flag the related job/worker for manual review.
+      break;
+    }
+    case "checkout.session.completed": {
+      const checkoutSession = event.data.object;
+      if (checkoutSession.metadata?.purpose === "credit_deposit") {
+        const userId = checkoutSession.metadata.userId;
+        const amountCents = checkoutSession.amount_total;
+        if (userId && amountCents) {
+          try {
+            await depositCredits({
+              userId,
+              amountCents,
+              reference: `stripe_checkout:${checkoutSession.id}`,
+              metadata: { stripeCheckoutSessionId: checkoutSession.id },
+            });
+          } catch {
+            // Unique constraint on reference — this session was already
+            // credited (webhook retry). Safe to ignore.
+          }
+        }
+      }
       break;
     }
     default:
